@@ -15,6 +15,7 @@
 
 package com.amazon.opendistroforelasticsearch.ad.transport;
 
+import static com.amazon.opendistroforelasticsearch.ad.TestHelpers.createIndexBlockedState;
 import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
 import static org.hamcrest.CoreMatchers.startsWith;
 import static org.hamcrest.Matchers.empty;
@@ -40,6 +41,7 @@ import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.verify;
 
 import java.io.IOException;
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -47,15 +49,13 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 
 import com.amazon.opendistroforelasticsearch.ad.breaker.ADCircuitBreakerService;
 import com.amazon.opendistroforelasticsearch.ad.indices.AnomalyDetectionIndices;
 
 import com.amazon.opendistroforelasticsearch.ad.AbstractADTest;
-import com.amazon.opendistroforelasticsearch.ad.TestHelpers;
 import com.amazon.opendistroforelasticsearch.ad.cluster.HashRing;
 import com.amazon.opendistroforelasticsearch.ad.common.exception.AnomalyDetectionException;
 import com.amazon.opendistroforelasticsearch.ad.common.exception.ClientException;
@@ -81,8 +81,8 @@ import com.amazon.opendistroforelasticsearch.ad.stats.suppliers.CounterSupplier;
 import com.amazon.opendistroforelasticsearch.ad.util.ClientUtil;
 import com.amazon.opendistroforelasticsearch.ad.util.ColdStartRunner;
 import com.amazon.opendistroforelasticsearch.ad.util.IndexUtils;
+import com.amazon.opendistroforelasticsearch.ad.util.Throttler;
 import org.elasticsearch.ElasticsearchTimeoutException;
-import org.elasticsearch.Version;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.ActionRequestValidationException;
 import org.elasticsearch.action.admin.indices.create.CreateIndexResponse;
@@ -94,20 +94,15 @@ import org.elasticsearch.client.Client;
 import org.elasticsearch.cluster.ClusterName;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.block.ClusterBlocks;
-import org.elasticsearch.cluster.metadata.AliasMetaData;
 import org.elasticsearch.cluster.metadata.IndexMetaData;
 import org.elasticsearch.cluster.metadata.IndexNameExpressionResolver;
-import org.elasticsearch.cluster.metadata.MetaData;
 import org.elasticsearch.cluster.node.DiscoveryNode;
 import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.Strings;
-import org.elasticsearch.common.UUIDs;
 import org.elasticsearch.common.io.stream.BytesStreamOutput;
 import org.elasticsearch.common.io.stream.NotSerializableExceptionWrapper;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.common.unit.TimeValue;
-import org.elasticsearch.common.util.concurrent.EsRejectedExecutionException;
 import org.elasticsearch.common.xcontent.ToXContent;
 import org.elasticsearch.common.xcontent.XContentBuilder;
 import org.elasticsearch.index.Index;
@@ -188,6 +183,7 @@ public class AnomalyResultTests extends AbstractADTest {
         List<String> userIndex = new ArrayList<>();
         userIndex.add("test*");
         when(detector.getIndices()).thenReturn(userIndex);
+        when(detector.getDetectorId()).thenReturn("testDetectorId");
         when(stateManager.getAnomalyDetector(any(String.class))).thenReturn(Optional.of(detector));
 
         hashRing = mock(HashRing.class);
@@ -232,8 +228,10 @@ public class AnomalyResultTests extends AbstractADTest {
         }).when(client).index(any(), any());
 
         indexNameResolver = new IndexNameExpressionResolver();
-
-        ClientUtil clientUtil = new ClientUtil(Settings.EMPTY, client);
+        Clock clock = mock(Clock.class);
+        Throttler throttler = new Throttler(clock);
+        ThreadPool threadpool = mock(ThreadPool.class);
+        ClientUtil clientUtil = new ClientUtil(Settings.EMPTY, client, throttler, threadpool);
         IndexUtils indexUtils = new IndexUtils(client, clientUtil, clusterService);
 
         Map<String, ADStat<?>> statsMap = new HashMap<String, ADStat<?>>() {
@@ -274,14 +272,14 @@ public class AnomalyResultTests extends AbstractADTest {
             });
 
             return null;
-        }).when(anomalyDetectionIndices).initAnomalyResultIndex(any());
+        }).when(anomalyDetectionIndices).initAnomalyResultIndexDirectly(any());
 
         when(anomalyDetectionIndices.doesAnomalyResultIndexExist()).thenReturn(anomalyResultIndexExists);
     }
 
     public void setupInitResultIndexException(Class<? extends Throwable> exceptionType) throws IOException {
         anomalyDetectionIndices = mock(AnomalyDetectionIndices.class);
-        doThrow(exceptionType).when(anomalyDetectionIndices).initAnomalyResultIndex(any());
+        doThrow(exceptionType).when(anomalyDetectionIndices).initAnomalyResultIndexDirectly(any());
 
         when(anomalyDetectionIndices.doesAnomalyResultIndexExist()).thenReturn(false);
     }
@@ -343,7 +341,7 @@ public class AnomalyResultTests extends AbstractADTest {
         PlainActionFuture<AnomalyResultResponse> listener = new PlainActionFuture<>();
         action.doExecute(null, request, listener);
 
-        AnomalyResultResponse response = listener.actionGet();
+        AnomalyResultResponse response = listener.actionGet(10000L);
         assertAnomalyResultResponse(response, 0, 1, 0d);
     }
 
@@ -723,91 +721,6 @@ public class AnomalyResultTests extends AbstractADTest {
         assertThat(exception.getMessage(), containsString(AnomalyResultTransportAction.NODE_UNRESPONSIVE_ERR_MSG));
     }
 
-    public void testRCFLatchAwaitException() throws InterruptedException {
-
-        // These constructors register handler in transport service
-        new RCFResultTransportAction(
-            new ActionFilters(Collections.emptySet()),
-            transportService,
-            normalModelManager,
-            adCircuitBreakerService
-        );
-        new ThresholdResultTransportAction(new ActionFilters(Collections.emptySet()), transportService, normalModelManager);
-
-        AnomalyResultTransportAction action = spy(
-            new AnomalyResultTransportAction(
-                new ActionFilters(Collections.emptySet()),
-                transportService,
-                client,
-                settings,
-                stateManager,
-                runner,
-                anomalyDetectionIndices,
-                featureQuery,
-                normalModelManager,
-                hashRing,
-                clusterService,
-                indexNameResolver,
-                threadPool,
-                adCircuitBreakerService,
-                adStats
-            )
-        );
-
-        CountDownLatch latch = mock(CountDownLatch.class);
-        doThrow(InterruptedException.class).when(latch).await(anyLong(), any(TimeUnit.class));
-        when(action.createCountDownLatch(anyInt())).thenReturn(latch);
-
-        AnomalyResultRequest request = new AnomalyResultRequest(adID, 100, 200);
-        PlainActionFuture<AnomalyResultResponse> listener = new PlainActionFuture<>();
-        action.doExecute(null, request, listener);
-
-        Throwable nestedCause = assertException(listener, AnomalyDetectionException.class);
-        assertEquals(CommonErrorMessages.WAIT_ERR_MSG, nestedCause.getMessage());
-    }
-
-    public void testThresholdLatchAwaitException() throws InterruptedException {
-        // These constructors register handler in transport service
-        new RCFResultTransportAction(
-            new ActionFilters(Collections.emptySet()),
-            transportService,
-            normalModelManager,
-            adCircuitBreakerService
-        );
-        new ThresholdResultTransportAction(new ActionFilters(Collections.emptySet()), transportService, normalModelManager);
-
-        AnomalyResultTransportAction action = spy(
-            new AnomalyResultTransportAction(
-                new ActionFilters(Collections.emptySet()),
-                transportService,
-                client,
-                settings,
-                stateManager,
-                new ColdStartRunner(),
-                anomalyDetectionIndices,
-                featureQuery,
-                normalModelManager,
-                hashRing,
-                clusterService,
-                indexNameResolver,
-                threadPool,
-                adCircuitBreakerService,
-                adStats
-            )
-        );
-
-        CountDownLatch latch = mock(CountDownLatch.class);
-        doThrow(InterruptedException.class).when(latch).await(anyLong(), any(TimeUnit.class));
-        when(action.createCountDownLatch(eq(1))).thenReturn(latch);
-
-        AnomalyResultRequest request = new AnomalyResultRequest(adID, 100, 200);
-        PlainActionFuture<AnomalyResultResponse> listener = new PlainActionFuture<>();
-        action.doExecute(null, request, listener);
-
-        Throwable nestedCause = assertException(listener, AnomalyDetectionException.class);
-        assertEquals(AnomalyResultTransportAction.WAIT_FOR_THRESHOLD_ERR_MSG, nestedCause.getMessage());
-    }
-
     public void alertingRequestTemplate(boolean anomalyResultIndexExists) throws IOException {
         setUpSavingAnomalyResultIndex(anomalyResultIndexExists);
         // These constructors register handler in transport service
@@ -886,6 +799,7 @@ public class AnomalyResultTests extends AbstractADTest {
         AnomalyResultResponse response = new AnomalyResultResponse(
             4,
             0.993,
+            1.01,
             Collections.singletonList(new FeatureData(featureId, featureName, 0d))
         );
         BytesStreamOutput output = new BytesStreamOutput();
@@ -900,6 +814,7 @@ public class AnomalyResultTests extends AbstractADTest {
         AnomalyResultResponse response = new AnomalyResultResponse(
             4,
             0.993,
+            1.01,
             Collections.singletonList(new FeatureData(featureId, featureName, 0d))
         );
         XContentBuilder builder = jsonBuilder();
@@ -921,6 +836,7 @@ public class AnomalyResultTests extends AbstractADTest {
         AnomalyResultResponse readResponse = new AnomalyResultResponse(
             JsonDeserializer.getDoubleValue(json, AnomalyResultResponse.ANOMALY_GRADE_JSON_KEY),
             JsonDeserializer.getDoubleValue(json, AnomalyResultResponse.CONFIDENCE_JSON_KEY),
+            JsonDeserializer.getDoubleValue(json, AnomalyResultResponse.ANOMALY_SCORE_JSON_KEY),
             JsonDeserializer.getListValue(json, function, AnomalyResultResponse.FEATURES_JSON_KEY)
         );
         assertAnomalyResultResponse(readResponse, readResponse.getAnomalyGrade(), readResponse.getConfidence(), 0d);
@@ -988,13 +904,14 @@ public class AnomalyResultTests extends AbstractADTest {
             adCircuitBreakerService,
             adStats
         );
-        AnomalyResultTransportAction.RCFActionListener listener = action.new RCFActionListener(null, null, null, null);
+        AnomalyResultTransportAction.RCFActionListener listener = action.new RCFActionListener(
+            null, null, null, null, null, null, null, null, null, 0, 0, 0, new AtomicInteger(), null
+        );
         listener.onFailure(null);
     }
 
     public void testColdStartNoTrainingData() throws Exception {
         when(featureQuery.getColdStartData(any(AnomalyDetector.class))).thenReturn(Optional.empty());
-
         AnomalyResultTransportAction action = new AnomalyResultTransportAction(
             new ActionFilters(Collections.emptySet()),
             transportService,
@@ -1045,104 +962,6 @@ public class AnomalyResultTests extends AbstractADTest {
         expectThrows(ClientException.class, () -> job.call());
     }
 
-    /**
-     * Template to test exponential backoff retry during saving anomaly result.
-     *
-     * @param throwEsRejectedExecutionException whether to throw
-     *                                          EsRejectedExecutionException in the
-     *                                          client::index mock or not
-     * @param latchCount                        used for coordinating. Equal to
-     *                                          number of expected retries plus 1.
-     * @throws InterruptedException if thread execution is interrupted
-     * @throws IOException          if IO failures
-     */
-    @SuppressWarnings("unchecked")
-    public void savingFailureTemplate(boolean throwEsRejectedExecutionException, int latchCount) throws InterruptedException, IOException {
-        setUpSavingAnomalyResultIndex(false);
-
-        final CountDownLatch backoffLatch = new CountDownLatch(latchCount);
-
-        Client badClient = mock(Client.class);
-        doAnswer(invocation -> {
-            Object[] args = invocation.getArguments();
-            assertTrue(String.format("The size of args is %d.  Its content is %s", args.length, Arrays.toString(args)), args.length >= 2);
-
-            IndexRequest request = null;
-            ActionListener<IndexResponse> listener = null;
-            if (args[0] instanceof IndexRequest) {
-                request = (IndexRequest) args[0];
-            }
-            if (args[1] instanceof ActionListener) {
-                listener = (ActionListener<IndexResponse>) args[1];
-            }
-
-            assertTrue(request != null && listener != null);
-            if (throwEsRejectedExecutionException) {
-                listener.onFailure(new EsRejectedExecutionException(""));
-            } else {
-                listener.onFailure(new IllegalArgumentException());
-            }
-
-            backoffLatch.countDown();
-            return null;
-        }).when(badClient).index(any(), any());
-
-        Settings backoffSettings = Settings
-            .builder()
-            .put("opendistro.anomaly_detection.max_retry_for_backoff", 2)
-            .put("opendistro.anomaly_detection.backoff_initial_delay", TimeValue.timeValueMillis(1))
-            .build();
-
-        // These constructors register handler in transport service
-        new RCFResultTransportAction(
-            new ActionFilters(Collections.emptySet()),
-            transportService,
-            normalModelManager,
-            adCircuitBreakerService
-        );
-        new ThresholdResultTransportAction(new ActionFilters(Collections.emptySet()), transportService, normalModelManager);
-
-        AnomalyResultTransportAction action = new AnomalyResultTransportAction(
-            new ActionFilters(Collections.emptySet()),
-            transportService,
-            badClient,
-            backoffSettings,
-            stateManager,
-            runner,
-            anomalyDetectionIndices,
-            featureQuery,
-            normalModelManager,
-            hashRing,
-            clusterService,
-            indexNameResolver,
-            threadPool,
-            adCircuitBreakerService,
-            adStats
-        );
-
-        AnomalyResultRequest request = new AnomalyResultRequest(adID, 100, 200);
-        PlainActionFuture<AnomalyResultResponse> listener = new PlainActionFuture<>();
-        action.doExecute(null, request, listener);
-
-        backoffLatch.await();
-    }
-
-    public void testSavingFailureNotRetry() throws InterruptedException, IOException {
-        savingFailureTemplate(false, 1);
-
-        assertEquals(1, testAppender.countMessage((AnomalyResultTransportAction.FAIL_TO_SAVE_ERR_MSG)));
-        assertTrue(!testAppender.containsMessage(AnomalyResultTransportAction.SUCCESS_SAVING_MSG));
-        assertTrue(!testAppender.containsMessage(AnomalyResultTransportAction.RETRY_SAVING_ERR_MSG));
-    }
-
-    public void testSavingFailureRetry() throws InterruptedException, IOException {
-        savingFailureTemplate(true, 3);
-
-        assertEquals(2, testAppender.countMessage((AnomalyResultTransportAction.RETRY_SAVING_ERR_MSG)));
-        assertEquals(1, testAppender.countMessage((AnomalyResultTransportAction.FAIL_TO_SAVE_ERR_MSG)));
-        assertTrue(!testAppender.containsMessage(AnomalyResultTransportAction.SUCCESS_SAVING_MSG));
-    }
-
     enum FeatureTestMode {
         FEATURE_NOT_AVAILABLE,
         ILLEGAL_STATE,
@@ -1187,6 +1006,7 @@ public class AnomalyResultTests extends AbstractADTest {
             AnomalyResultResponse response = listener.actionGet();
             assertEquals(Double.NaN, response.getAnomalyGrade(), 0.001);
             assertEquals(Double.NaN, response.getConfidence(), 0.001);
+            assertEquals(Double.NaN, response.getAnomalyScore(), 0.001);
             assertThat(response.getFeatures(), is(empty()));
         } else if (mode == FeatureTestMode.ILLEGAL_STATE || mode == FeatureTestMode.AD_EXCEPTION) {
             assertException(listener, InternalFailure.class);
@@ -1271,32 +1091,6 @@ public class AnomalyResultTests extends AbstractADTest {
         assertException(listener, AnomalyDetectionException.class, errLogMsg);
     }
 
-    private ClusterState createIndexBlockedState(String indexName, Settings hackedSettings, String alias) {
-        ClusterState blockedClusterState = null;
-        IndexMetaData.Builder builder = IndexMetaData.builder(indexName);
-        if (alias != null) {
-            builder.putAlias(AliasMetaData.builder(alias));
-        }
-        IndexMetaData indexMetaData = builder
-            .settings(
-                Settings
-                    .builder()
-                    .put(IndexMetaData.SETTING_INDEX_UUID, UUIDs.randomBase64UUID())
-                    .put(IndexMetaData.SETTING_NUMBER_OF_SHARDS, 1)
-                    .put(IndexMetaData.SETTING_NUMBER_OF_REPLICAS, 0)
-                    .put(IndexMetaData.SETTING_VERSION_CREATED, Version.CURRENT)
-                    .put(hackedSettings)
-            )
-            .build();
-        MetaData metaData = MetaData.builder().put(indexMetaData, false).build();
-        blockedClusterState = ClusterState
-            .builder(new ClusterName("test cluster"))
-            .metaData(metaData)
-            .blocks(ClusterBlocks.builder().addBlocks(indexMetaData))
-            .build();
-        return blockedClusterState;
-    }
-
     private void globalBlockTemplate(BlockType type, String errLogMsg) {
         globalBlockTemplate(type, errLogMsg, null, null);
     }
@@ -1318,38 +1112,6 @@ public class AnomalyResultTests extends AbstractADTest {
         );
     }
 
-    public void testIndexWriteBlock() {
-
-        ClusterState blockedClusterState = createIndexBlockedState(
-            UUIDs.randomBase64UUID(),
-            Settings.builder().put(IndexMetaData.INDEX_BLOCKS_WRITE_SETTING.getKey(), true).build(),
-            AnomalyResult.ANOMALY_RESULT_INDEX
-        );
-        ClusterService hackedClusterService = spy(clusterService);
-        when(hackedClusterService.state()).thenReturn(blockedClusterState);
-
-        AnomalyResultTransportAction action = new AnomalyResultTransportAction(
-            new ActionFilters(Collections.emptySet()),
-            transportService,
-            client,
-            settings,
-            stateManager,
-            runner,
-            anomalyDetectionIndices,
-            featureQuery,
-            normalModelManager,
-            hashRing,
-            hackedClusterService,
-            indexNameResolver,
-            threadPool,
-            adCircuitBreakerService,
-            adStats
-        );
-        action.indexAnomalyResult(TestHelpers.randomAnomalyDetectResult());
-
-        assertTrue(testAppender.containsMessage(AnomalyResultTransportAction.CANNOT_SAVE_ERR_MSG));
-    }
-
     public void testNullRCFResult() {
         AnomalyResultTransportAction action = new AnomalyResultTransportAction(
             new ActionFilters(Collections.emptySet()),
@@ -1368,7 +1130,9 @@ public class AnomalyResultTests extends AbstractADTest {
             adCircuitBreakerService,
             adStats
         );
-        AnomalyResultTransportAction.RCFActionListener listener = action.new RCFActionListener(null, "123-rcf-0", null, "123");
+        AnomalyResultTransportAction.RCFActionListener listener = action.new RCFActionListener(
+            null, "123-rcf-0", null, "123", null, null, null, null, null, 0, 0, 0, new AtomicInteger(), null
+        );
         listener.onResponse(null);
         assertTrue(testAppender.containsMessage(AnomalyResultTransportAction.NULL_RESPONSE));
     }

@@ -15,6 +15,7 @@
 
 package com.amazon.opendistroforelasticsearch.ad.feature;
 
+import java.io.IOException;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -30,6 +31,7 @@ import com.amazon.opendistroforelasticsearch.ad.dataprocessor.LinearUniformInter
 import com.amazon.opendistroforelasticsearch.ad.dataprocessor.SingleFeatureLinearUniformInterpolator;
 import com.amazon.opendistroforelasticsearch.ad.model.AnomalyDetector;
 import com.amazon.opendistroforelasticsearch.ad.model.IntervalTimeConfiguration;
+import com.amazon.opendistroforelasticsearch.ad.transport.ADStateManager;
 import junitparams.JUnitParamsRunner;
 import junitparams.Parameters;
 
@@ -87,6 +89,9 @@ public class FeatureManagerTests {
 
     @Mock
     private Clock clock;
+
+    @Mock
+    private ADStateManager stateManager;
 
     private FeatureManager featureManager;
 
@@ -308,6 +313,7 @@ public class FeatureManagerTests {
         for (int i = 1; i <= shingleSize; i++) {
             start = i * 10;
             end = (i + 1) * 10;
+
             when(searchFeatureDao.getFeaturesForPeriod(detector, start, end)).thenReturn(Optional.of(new double[] { i }));
             featureManager.getCurrentFeatures(detector, start, end);
         }
@@ -329,6 +335,7 @@ public class FeatureManagerTests {
         for (int i = 1; i <= shingleSize; i++) {
             start = i * 10;
             end = (i + 1) * 10;
+
             when(searchFeatureDao.getFeaturesForPeriod(detector, start, end)).thenReturn(Optional.of(new double[] { i }));
             featureManager.getCurrentFeatures(detector, start, end);
         }
@@ -351,6 +358,7 @@ public class FeatureManagerTests {
         for (int i = 1; i <= shingleSize; i++) {
             start = i * 10;
             end = (i + 1) * 10;
+
             when(searchFeatureDao.getFeaturesForPeriod(detector, start, end)).thenReturn(Optional.of(new double[] { i }));
             featureManager.getCurrentFeatures(detector, start, end);
         }
@@ -402,7 +410,8 @@ public class FeatureManagerTests {
     }
 
     @SuppressWarnings("unchecked")
-    private void getPreviewFeaturesTemplate(List<Optional<double[]>> samplesResults, boolean querySuccess, boolean previewSuccess) {
+    private void getPreviewFeaturesTemplate(List<Optional<double[]>> samplesResults, boolean querySuccess, boolean previewSuccess)
+        throws IOException {
         long start = 0L;
         long end = 240_000L;
         IntervalTimeConfiguration detectionInterval = new IntervalTimeConfiguration(1, ChronoUnit.MINUTES);
@@ -451,17 +460,17 @@ public class FeatureManagerTests {
     }
 
     @Test
-    public void getPreviewFeatures_returnExpectedToListener() {
+    public void getPreviewFeatures_returnExpectedToListener() throws IOException {
         getPreviewFeaturesTemplate(asList(Optional.of(new double[] { 1 }), Optional.of(new double[] { 3 })), true, true);
     }
 
     @Test
-    public void getPreviewFeatures_returnExceptionToListener_whenNoDataToPreview() {
+    public void getPreviewFeatures_returnExceptionToListener_whenNoDataToPreview() throws IOException {
         getPreviewFeaturesTemplate(asList(), true, false);
     }
 
     @Test
-    public void getPreviewFeatures_returnExceptionToListener_whenQueryFail() {
+    public void getPreviewFeatures_returnExceptionToListener_whenQueryFail() throws IOException {
         getPreviewFeaturesTemplate(asList(Optional.of(new double[] { 1 }), Optional.of(new double[] { 3 })), false, false);
     }
 }

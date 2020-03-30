@@ -17,6 +17,7 @@ package com.amazon.opendistroforelasticsearch.ad.feature;
 
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.AbstractMap.SimpleEntry;
 import java.util.ArrayDeque;
 import java.util.HashMap;
@@ -41,10 +42,11 @@ import org.elasticsearch.action.search.SearchRequest;
 import org.elasticsearch.action.search.SearchResponse;
 import org.elasticsearch.client.Client;
 import org.elasticsearch.search.aggregations.AggregationBuilders;
+import org.elasticsearch.search.aggregations.Aggregations;
+import org.elasticsearch.search.aggregations.bucket.range.InternalDateRange;
 import org.elasticsearch.search.aggregations.metrics.Max;
 import org.elasticsearch.search.builder.SearchSourceBuilder;
 import org.elasticsearch.common.xcontent.NamedXContentRegistry;
-import org.elasticsearch.script.ScriptService;
 import org.elasticsearch.search.aggregations.Aggregation;
 import org.elasticsearch.search.aggregations.metrics.NumericMetricsAggregation.SingleValue;
 import org.elasticsearch.search.aggregations.metrics.InternalTDigestPercentiles;
@@ -60,13 +62,11 @@ import static org.apache.commons.math3.linear.MatrixUtils.createRealMatrix;
 public class SearchFeatureDao {
 
     protected static final String AGG_NAME_MAX = "max_timefield";
-    protected static final String FEATURE_SAMPLE_PREFERENCE = "_shards:0";
 
     private static final Logger logger = LogManager.getLogger(SearchFeatureDao.class);
 
     // Dependencies
     private final Client client;
-    private final ScriptService scriptService;
     private final NamedXContentRegistry xContent;
     private final Interpolator interpolator;
     private final ClientUtil clientUtil;
@@ -75,20 +75,12 @@ public class SearchFeatureDao {
      * Constructor injection.
      *
      * @param client ES client for queries
-     * @param scriptService ES ScriptService
      * @param xContent ES XContentRegistry
      * @param interpolator interpolator for missing values
      * @param clientUtil utility for ES client
      */
-    public SearchFeatureDao(
-        Client client,
-        ScriptService scriptService,
-        NamedXContentRegistry xContent,
-        Interpolator interpolator,
-        ClientUtil clientUtil
-    ) {
+    public SearchFeatureDao(Client client, NamedXContentRegistry xContent, Interpolator interpolator, ClientUtil clientUtil) {
         this.client = client;
-        this.scriptService = scriptService;
         this.xContent = xContent;
         this.interpolator = interpolator;
         this.clientUtil = clientUtil;
@@ -115,6 +107,12 @@ public class SearchFeatureDao {
 
     /**
      * Gets features for the given time period.
+     * This function also adds given detector to negative cache before sending es request.
+     * Once response/exception is received within timeout, this request will be treated as complete
+     * and cleared from the negative cache.
+     * Otherwise this detector entry remain in the negative to reject further request.
+     *
+     * @deprecated use getFeaturesForPeriod with listener instead.
      *
      * @param detector info about indices, documents, feature query
      * @param startTime epoch milliseconds at the beginning of the period
@@ -122,26 +120,39 @@ public class SearchFeatureDao {
      * @throws IllegalStateException when unexpected failures happen
      * @return features from search results, empty when no data found
      */
+    @Deprecated
     public Optional<double[]> getFeaturesForPeriod(AnomalyDetector detector, long startTime, long endTime) {
         SearchRequest searchRequest = createFeatureSearchRequest(detector, startTime, endTime, Optional.empty());
+
+        // send throttled request: this request will clear the negative cache if the request finished within timeout
         return clientUtil
-            .<SearchRequest, SearchResponse>timedRequest(searchRequest, logger, client::search)
+            .<SearchRequest, SearchResponse>throttledTimedRequest(searchRequest, logger, client::search, detector)
             .flatMap(resp -> parseResponse(resp, detector.getEnabledFeatureIds()));
     }
 
+    /**
+     * Returns to listener features for the given time period.
+     *
+     * @param detector info about indices, feature query
+     * @param startTime epoch milliseconds at the beginning of the period
+     * @param endTime epoch milliseconds at the end of the period
+     * @param listener onResponse is called with features for the given time period.
+     */
+    public void getFeaturesForPeriod(AnomalyDetector detector, long startTime, long endTime, ActionListener<Optional<double[]>> listener) {
+        SearchRequest searchRequest = createFeatureSearchRequest(detector, startTime, endTime, Optional.empty());
+        client
+            .search(
+                searchRequest,
+                ActionListener
+                    .wrap(response -> listener.onResponse(parseResponse(response, detector.getEnabledFeatureIds())), listener::onFailure)
+            );
+    }
+
     private Optional<double[]> parseResponse(SearchResponse response, List<String> featureIds) {
-        return Optional
-            .ofNullable(response)
-            .filter(resp -> response.getHits().getTotalHits().value > 0L)
-            .map(resp -> resp.getAggregations())
-            .map(aggs -> aggs.asMap())
-            .map(
-                map -> featureIds
-                    .stream()
-                    .mapToDouble(id -> Optional.ofNullable(map.get(id)).map(this::parseAggregation).orElse(Double.NaN))
-                    .toArray()
-            )
-            .filter(result -> Arrays.stream(result).noneMatch(d -> Double.isNaN(d) || Double.isInfinite(d)));
+        return parseAggregations(
+            Optional.ofNullable(response).filter(resp -> response.getHits().getTotalHits().value > 0L).map(resp -> resp.getAggregations()),
+            featureIds
+        );
     }
 
     private double parseAggregation(Aggregation aggregation) {
@@ -171,7 +182,7 @@ public class SearchFeatureDao {
         MultiSearchRequest multiSearchRequest = new MultiSearchRequest();
         ranges
             .stream()
-            .map(range -> createFeatureSearchRequest(detector, range.getKey(), range.getValue(), Optional.of(FEATURE_SAMPLE_PREFERENCE)))
+            .map(range -> createFeatureSearchRequest(detector, range.getKey(), range.getValue(), Optional.empty()))
             .forEachOrdered(request -> multiSearchRequest.add(request));
 
         return clientUtil
@@ -195,40 +206,33 @@ public class SearchFeatureDao {
      * @param detector info about the indices, documents, feature query
      * @param ranges list of time ranges
      * @param listener handle approximate features for the time ranges
+     * @throws IOException if a user gives wrong query input when defining a detector
      */
     public void getFeatureSamplesForPeriods(
         AnomalyDetector detector,
         List<Entry<Long, Long>> ranges,
         ActionListener<List<Optional<double[]>>> listener
-    ) {
-        MultiSearchRequest multiSearchRequest = new MultiSearchRequest();
-        ranges
-            .stream()
-            .map(range -> createFeatureSearchRequest(detector, range.getKey(), range.getValue(), Optional.of(FEATURE_SAMPLE_PREFERENCE)))
-            .forEachOrdered(request -> multiSearchRequest.add(request));
+    ) throws IOException {
+        SearchRequest request = createPreviewSearchRequest(detector, ranges);
 
-        client
-            .multiSearch(
-                multiSearchRequest,
-                ActionListener
-                    .wrap(
-                        response -> listener
-                            .onResponse(
-                                Optional
-                                    .of(response)
-                                    .map(Stream::of)
-                                    .orElseGet(Stream::empty)
-                                    .flatMap(multiSearchResp -> Arrays.stream(multiSearchResp.getResponses()))
-                                    .map(
-                                        item -> Optional
-                                            .ofNullable(item.getResponse())
-                                            .flatMap(r -> parseResponse(r, detector.getEnabledFeatureIds()))
-                                    )
-                                    .collect(Collectors.toList())
-                            ),
-                        listener::onFailure
-                    )
-            );
+        client.search(request, ActionListener.wrap(response -> {
+            Aggregations aggs = response.getAggregations();
+            if (aggs == null) {
+                listener.onResponse(Collections.emptyList());
+                return;
+            }
+
+            listener
+                .onResponse(
+                    aggs
+                        .asList()
+                        .stream()
+                        .filter(InternalDateRange.class::isInstance)
+                        .flatMap(agg -> ((InternalDateRange) agg).getBuckets().stream())
+                        .map(bucket -> parseBucket(bucket, detector.getEnabledFeatureIds()))
+                        .collect(Collectors.toList())
+                );
+        }, listener::onFailure));
     }
 
     /**
@@ -326,8 +330,38 @@ public class SearchFeatureDao {
             SearchSourceBuilder searchSourceBuilder = ParseUtils.generateInternalFeatureQuery(detector, startTime, endTime, xContent);
             return new SearchRequest(detector.getIndices().toArray(new String[0]), searchSourceBuilder).preference(preference.orElse(null));
         } catch (IOException e) {
-            logger.warn("Failed to create feature search request for " + detector + " from " + startTime + " to " + endTime, e);
+            logger
+                .warn(
+                    "Failed to create feature search request for " + detector.getDetectorId() + " from " + startTime + " to " + endTime,
+                    e
+                );
             throw new IllegalStateException(e);
         }
+    }
+
+    private SearchRequest createPreviewSearchRequest(AnomalyDetector detector, List<Entry<Long, Long>> ranges) throws IOException {
+        try {
+            SearchSourceBuilder searchSourceBuilder = ParseUtils.generatePreviewQuery(detector, ranges, xContent);
+            return new SearchRequest(detector.getIndices().toArray(new String[0]), searchSourceBuilder);
+        } catch (IOException e) {
+            logger.warn("Failed to create feature search request for " + detector.getDetectorId() + " for preview", e);
+            throw e;
+        }
+    }
+
+    private Optional<double[]> parseBucket(InternalDateRange.Bucket bucket, List<String> featureIds) {
+        return parseAggregations(Optional.ofNullable(bucket).map(b -> b.getAggregations()), featureIds);
+    }
+
+    private Optional<double[]> parseAggregations(Optional<Aggregations> aggregations, List<String> featureIds) {
+        return aggregations
+            .map(aggs -> aggs.asMap())
+            .map(
+                map -> featureIds
+                    .stream()
+                    .mapToDouble(id -> Optional.ofNullable(map.get(id)).map(this::parseAggregation).orElse(Double.NaN))
+                    .toArray()
+            )
+            .filter(result -> Arrays.stream(result).noneMatch(d -> Double.isNaN(d) || Double.isInfinite(d)));
     }
 }

@@ -24,6 +24,7 @@ import com.amazon.opendistroforelasticsearch.ad.util.ClientUtil;
 
 import com.amazon.opendistroforelasticsearch.ad.model.AnomalyResult;
 import com.amazon.opendistroforelasticsearch.ad.util.RestHandlerUtils;
+import com.amazon.opendistroforelasticsearch.ad.util.Throttler;
 import org.elasticsearch.action.index.IndexRequest;
 import org.elasticsearch.action.index.IndexResponse;
 import org.elasticsearch.client.Client;
@@ -36,9 +37,11 @@ import org.elasticsearch.common.xcontent.XContentBuilder;
 import org.elasticsearch.common.xcontent.XContentFactory;
 import org.elasticsearch.rest.RestStatus;
 import org.elasticsearch.test.ESIntegTestCase;
+import org.elasticsearch.threadpool.ThreadPool;
 import org.junit.Before;
 
 import java.io.IOException;
+import java.time.Clock;
 import java.util.HashSet;
 import java.util.Set;
 
@@ -50,6 +53,7 @@ public class AnomalyDetectionIndicesTests extends ESIntegTestCase {
     private Settings settings;
     private ClusterService clusterService;
     private Client client;
+    private ThreadPool context;
 
     @Before
     public void setup() {
@@ -69,8 +73,11 @@ public class AnomalyDetectionIndicesTests extends ESIntegTestCase {
         clusterSettings.add(AnomalyDetectorSettings.REQUEST_TIMEOUT);
         clusterSetting = new ClusterSettings(settings, clusterSettings);
         clusterService = TestHelpers.createClusterService(client().threadPool(), clusterSetting);
+        context = TestHelpers.createThreadPool();
         client = mock(Client.class);
-        requestUtil = new ClientUtil(settings, client);
+        Clock clock = Clock.systemUTC();
+        Throttler throttler = new Throttler(clock);
+        requestUtil = new ClientUtil(settings, client, throttler, context);
         indices = new AnomalyDetectionIndices(client(), clusterService, client().threadPool(), settings, requestUtil);
     }
 

@@ -15,13 +15,15 @@
 
 package com.amazon.opendistroforelasticsearch.ad;
 
-import com.amazon.opendistroforelasticsearch.ad.model.AnomalyDetectorExecutionInput;
-import com.amazon.opendistroforelasticsearch.ad.model.AnomalyResult;
 import com.amazon.opendistroforelasticsearch.ad.model.AnomalyDetector;
+import com.amazon.opendistroforelasticsearch.ad.model.AnomalyDetectorExecutionInput;
+import com.amazon.opendistroforelasticsearch.ad.model.AnomalyDetectorJob;
+import com.amazon.opendistroforelasticsearch.ad.model.AnomalyResult;
 import com.amazon.opendistroforelasticsearch.ad.model.Feature;
 import com.amazon.opendistroforelasticsearch.ad.model.FeatureData;
 import com.amazon.opendistroforelasticsearch.ad.model.IntervalTimeConfiguration;
 import com.amazon.opendistroforelasticsearch.ad.model.TimeConfiguration;
+import com.amazon.opendistroforelasticsearch.jobscheduler.spi.schedule.IntervalSchedule;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import org.apache.http.Header;
@@ -39,13 +41,21 @@ import org.elasticsearch.client.Request;
 import org.elasticsearch.client.RequestOptions;
 import org.elasticsearch.client.Response;
 import org.elasticsearch.client.RestClient;
+import org.elasticsearch.cluster.ClusterName;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.block.ClusterBlocks;
+import org.elasticsearch.cluster.metadata.AliasMetaData;
+import org.elasticsearch.cluster.metadata.IndexMetaData;
+import org.elasticsearch.cluster.metadata.MetaData;
 import org.elasticsearch.cluster.node.DiscoveryNode;
 import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.CheckedConsumer;
 import org.elasticsearch.common.Priority;
+import org.elasticsearch.common.UUIDs;
 import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.settings.ClusterSettings;
 import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.util.concurrent.ThreadContext;
 import org.elasticsearch.common.xcontent.LoggingDeprecationHandler;
 import org.elasticsearch.common.xcontent.NamedXContentRegistry;
 import org.elasticsearch.common.xcontent.XContentBuilder;
@@ -76,12 +86,14 @@ import static org.elasticsearch.test.ESTestCase.randomAlphaOfLength;
 import static org.elasticsearch.test.ESTestCase.randomDouble;
 import static org.elasticsearch.test.ESTestCase.randomInt;
 import static org.elasticsearch.test.ESTestCase.randomLong;
+import static org.powermock.api.mockito.PowerMockito.mock;
+import static org.powermock.api.mockito.PowerMockito.when;
 
 public class TestHelpers {
 
     public static final String AD_BASE_DETECTORS_URI = "/_opendistro/_anomaly_detection/detectors";
     public static final String AD_BASE_RESULT_URI = "/_opendistro/_anomaly_detection/detectors/results";
-    public static final String AD_BASE_PREVIEW_URI = "/_opendistro/_anomaly_detection/detectors/_preview";
+    public static final String AD_BASE_PREVIEW_URI = "/_opendistro/_anomaly_detection/detectors/%s/_preview";
     public static final String AD_BASE_STATS_URI = "/_opendistro/_anomaly_detection/stats";
     private static final Logger logger = LogManager.getLogger(TestHelpers.class);
 
@@ -159,6 +171,42 @@ public class TestHelpers {
         );
     }
 
+    public static AnomalyDetector randomAnomalyDetector(List<Feature> features) throws IOException {
+        return new AnomalyDetector(
+            randomAlphaOfLength(10),
+            randomLong(),
+            randomAlphaOfLength(20),
+            randomAlphaOfLength(30),
+            randomAlphaOfLength(5),
+            ImmutableList.of(randomAlphaOfLength(10).toLowerCase()),
+            features,
+            randomQuery(),
+            randomIntervalTimeConfiguration(),
+            randomIntervalTimeConfiguration(),
+            null,
+            randomInt(),
+            Instant.now()
+        );
+    }
+
+    public static AnomalyDetector randomAnomalyDetectorWithEmptyFeature() throws IOException {
+        return new AnomalyDetector(
+            randomAlphaOfLength(10),
+            randomLong(),
+            randomAlphaOfLength(20),
+            randomAlphaOfLength(30),
+            randomAlphaOfLength(5),
+            ImmutableList.of(randomAlphaOfLength(10).toLowerCase()),
+            ImmutableList.of(),
+            randomQuery(),
+            randomIntervalTimeConfiguration(),
+            randomIntervalTimeConfiguration(),
+            null,
+            randomInt(),
+            Instant.now().truncatedTo(ChronoUnit.SECONDS)
+        );
+    }
+
     public static SearchSourceBuilder randomFeatureQuery() throws IOException {
         String query = "{\"query\":{\"match\":{\"user\":{\"query\":\"kimchy\",\"operator\":\"OR\",\"prefix_length\":0,"
             + "\"max_expansions\":50,\"fuzzy_transpositions\":true,\"lenient\":false,\"zero_terms_query\":\"NONE\","
@@ -181,7 +229,11 @@ public class TestHelpers {
     }
 
     public static AggregationBuilder randomAggregation() throws IOException {
-        XContentParser parser = parser("{\"aa\":{\"value_count\":{\"field\":\"ok\"}}}");
+        return randomAggregation(randomAlphaOfLength(5));
+    }
+
+    public static AggregationBuilder randomAggregation(String aggregationName) throws IOException {
+        XContentParser parser = parser("{\"" + aggregationName + "\":{\"value_count\":{\"field\":\"ok\"}}}");
 
         AggregatorFactories.Builder parsed = AggregatorFactories.parseAggregators(parser);
         return parsed.getAggregatorFactories().iterator().next();
@@ -195,15 +247,27 @@ public class TestHelpers {
         return new IntervalTimeConfiguration(ESRestTestCase.randomLongBetween(1, 1000), ChronoUnit.MINUTES);
     }
 
+    public static IntervalSchedule randomIntervalSchedule() {
+        return new IntervalSchedule(
+            Instant.now().truncatedTo(ChronoUnit.SECONDS),
+            ESRestTestCase.randomIntBetween(1, 1000),
+            ChronoUnit.MINUTES
+        );
+    }
+
     public static Feature randomFeature() {
+        return randomFeature(randomAlphaOfLength(5), randomAlphaOfLength(5));
+    }
+
+    public static Feature randomFeature(String featureName, String aggregationName) {
         AggregationBuilder testAggregation = null;
         try {
-            testAggregation = randomAggregation();
+            testAggregation = randomAggregation(aggregationName);
         } catch (IOException e) {
             logger.error("Fail to generate test aggregation");
             throw new RuntimeException();
         }
-        return new Feature(randomAlphaOfLength(5), randomAlphaOfLength(5), ESRestTestCase.randomBoolean(), testAggregation);
+        return new Feature(randomAlphaOfLength(5), featureName, ESRestTestCase.randomBoolean(), testAggregation);
     }
 
     public static <S, T> void assertFailWith(Class<S> clazz, Callable<T> callable) throws Exception {
@@ -235,15 +299,32 @@ public class TestHelpers {
             randomDouble(),
             ImmutableList.of(randomFeatureData(), randomFeatureData()),
             Instant.now().truncatedTo(ChronoUnit.SECONDS),
-            Instant.now().truncatedTo(ChronoUnit.SECONDS)
+            Instant.now().truncatedTo(ChronoUnit.SECONDS),
+            Instant.now().truncatedTo(ChronoUnit.SECONDS),
+            Instant.now().truncatedTo(ChronoUnit.SECONDS),
+            randomAlphaOfLength(5)
         );
     }
 
-    public static AnomalyDetectorExecutionInput randomAnomalyDetectorExecutionInput() {
+    public static AnomalyDetectorJob randomAnomalyDetectorJob() {
+        return new AnomalyDetectorJob(
+            randomAlphaOfLength(10),
+            randomIntervalSchedule(),
+            randomIntervalTimeConfiguration(),
+            true,
+            Instant.now().truncatedTo(ChronoUnit.SECONDS),
+            Instant.now().truncatedTo(ChronoUnit.SECONDS),
+            Instant.now().truncatedTo(ChronoUnit.SECONDS),
+            60L
+        );
+    }
+
+    public static AnomalyDetectorExecutionInput randomAnomalyDetectorExecutionInput() throws IOException {
         return new AnomalyDetectorExecutionInput(
             randomAlphaOfLength(5),
             Instant.now().minus(10, ChronoUnit.MINUTES).truncatedTo(ChronoUnit.SECONDS),
-            Instant.now().truncatedTo(ChronoUnit.SECONDS)
+            Instant.now().truncatedTo(ChronoUnit.SECONDS),
+            randomAnomalyDetector(null, Instant.now().truncatedTo(ChronoUnit.SECONDS))
         );
     }
 
@@ -267,5 +348,45 @@ public class TestHelpers {
             Version.CURRENT
         );
         return ClusterServiceUtils.createClusterService(threadPool, discoveryNode, clusterSettings);
+    }
+
+    public static ClusterState createIndexBlockedState(String indexName, Settings hackedSettings, String alias) {
+        ClusterState blockedClusterState = null;
+        IndexMetaData.Builder builder = IndexMetaData.builder(indexName);
+        if (alias != null) {
+            builder.putAlias(AliasMetaData.builder(alias));
+        }
+        IndexMetaData indexMetaData = builder
+            .settings(
+                Settings
+                    .builder()
+                    .put(IndexMetaData.SETTING_INDEX_UUID, UUIDs.randomBase64UUID())
+                    .put(IndexMetaData.SETTING_NUMBER_OF_SHARDS, 1)
+                    .put(IndexMetaData.SETTING_NUMBER_OF_REPLICAS, 0)
+                    .put(IndexMetaData.SETTING_VERSION_CREATED, Version.CURRENT)
+                    .put(hackedSettings)
+            )
+            .build();
+        MetaData metaData = MetaData.builder().put(indexMetaData, false).build();
+        blockedClusterState = ClusterState
+            .builder(new ClusterName("test cluster"))
+            .metaData(metaData)
+            .blocks(ClusterBlocks.builder().addBlocks(indexMetaData))
+            .build();
+        return blockedClusterState;
+    }
+
+    public static ThreadContext createThreadContext() {
+        Settings build = Settings.builder().put("request.headers.default", "1").build();
+        ThreadContext context = new ThreadContext(build);
+        context.putHeader("foo", "bar");
+        context.putTransient("x", 1);
+        return context;
+    }
+
+    public static ThreadPool createThreadPool() {
+        ThreadPool pool = mock(ThreadPool.class);
+        when(pool.getThreadContext()).thenReturn(createThreadContext());
+        return pool;
     }
 }

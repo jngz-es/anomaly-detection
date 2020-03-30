@@ -27,6 +27,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.elasticsearch.action.ActionListener;
 
+import java.io.IOException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -58,16 +59,8 @@ public final class AnomalyDetectorRunner {
      * @param endTime   detection period end time
      * @param listener handle anomaly result
      */
-    public void run(AnomalyDetector detector, Instant startTime, Instant endTime, ActionListener<List<AnomalyResult>> listener) {
-        executeDetector(detector, startTime, endTime, listener);
-    }
-
-    private void executeDetector(
-        AnomalyDetector detector,
-        Instant startTime,
-        Instant endTime,
-        ActionListener<List<AnomalyResult>> listener
-    ) {
+    public void executeDetector(AnomalyDetector detector, Instant startTime, Instant endTime, ActionListener<List<AnomalyResult>> listener)
+        throws IOException {
         featureManager.getPreviewFeatures(detector, startTime.toEpochMilli(), endTime.toEpochMilli(), ActionListener.wrap(features -> {
             try {
                 List<ThresholdingResult> results = modelManager.getPreviewResults(features.getProcessedFeatures());
@@ -114,7 +107,10 @@ public final class AnomalyDetectorRunner {
                         thresholdingResult.getConfidence(),
                         featureDatas,
                         Instant.ofEpochMilli(timeRange.getKey()),
-                        Instant.ofEpochMilli(timeRange.getValue())
+                        Instant.ofEpochMilli(timeRange.getValue()),
+                        null,
+                        null,
+                        null
                     );
                 } else {
                     result = new AnomalyResult(
@@ -124,7 +120,10 @@ public final class AnomalyDetectorRunner {
                         null,
                         featureDatas,
                         Instant.ofEpochMilli(timeRange.getKey()),
-                        Instant.ofEpochMilli(timeRange.getValue())
+                        Instant.ofEpochMilli(timeRange.getValue()),
+                        null,
+                        null,
+                        null
                     );
                 }
 

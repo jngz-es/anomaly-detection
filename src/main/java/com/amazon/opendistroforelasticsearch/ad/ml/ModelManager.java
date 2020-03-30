@@ -26,7 +26,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Optional;
-import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
@@ -41,6 +40,7 @@ import org.apache.logging.log4j.Logger;
 
 import com.google.gson.Gson;
 
+import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.monitor.jvm.JvmService;
 
@@ -320,6 +320,58 @@ public class ModelManager {
     }
 
     /**
+     * Returns to listener the RCF anomaly result using the specified model.
+     *
+     * @param detectorId ID of the detector
+     * @param modelId ID of the model to score the point
+     * @param point features of the data point
+     * @param listener onResponse is called with RCF result for the input point, including a score
+     *                 onFailure is called with ResourceNotFoundException when the model is not found
+     *                 onFailure is called with LimitExceededException when a limit is exceeded for the model
+     */
+    public void getRcfResult(String detectorId, String modelId, double[] point, ActionListener<RcfResult> listener) {
+        if (forests.containsKey(modelId)) {
+            getRcfResult(forests.get(modelId), point, listener);
+        } else {
+            checkpointDao
+                .getModelCheckpoint(
+                    modelId,
+                    ActionListener
+                        .wrap(checkpoint -> processRcfCheckpoint(checkpoint, modelId, detectorId, point, listener), listener::onFailure)
+                );
+        }
+    }
+
+    private void getRcfResult(ModelState<RandomCutForest> modelState, double[] point, ActionListener<RcfResult> listener) {
+        RandomCutForest rcf = modelState.getModel();
+        double score = rcf.getAnomalyScore(point);
+        double confidence = computeRcfConfidence(rcf);
+        int forestSize = rcf.getNumberOfTrees();
+        rcf.update(point);
+        modelState.setLastUsedTime(clock.instant());
+        listener.onResponse(new RcfResult(score, confidence, forestSize));
+    }
+
+    private void processRcfCheckpoint(
+        Optional<String> rcfCheckpoint,
+        String modelId,
+        String detectorId,
+        double[] point,
+        ActionListener<RcfResult> listener
+    ) {
+        Optional<ModelState<RandomCutForest>> model = rcfCheckpoint
+            .map(checkpoint -> AccessController.doPrivileged((PrivilegedAction<RandomCutForest>) () -> rcfSerde.fromJson(checkpoint)))
+            .filter(rcf -> isHostingAllowed(detectorId, rcf))
+            .map(rcf -> new ModelState<>(rcf, modelId, detectorId, ModelType.RCF.getName(), clock.instant()));
+        if (model.isPresent()) {
+            forests.put(modelId, model.get());
+            getRcfResult(model.get(), point, listener);
+        } else {
+            throw new ResourceNotFoundException(detectorId, CommonErrorMessages.NO_CHECKPOINT_ERR_MSG + modelId);
+        }
+    }
+
+    /**
      * Gets the result using the specified thresholding model.
      *
      * @deprecated use getThresholdingResult with listener instead.
@@ -351,6 +403,66 @@ public class ModelManager {
         threshold.update(score);
         modelState.setLastUsedTime(clock.instant());
         return new ThresholdingResult(grade, confidence);
+    }
+
+    /**
+     * Returns to listener the result using the specified thresholding model.
+     *
+     * @param detectorId ID of the detector
+     * @param modelId ID of the thresholding model
+     * @param score raw anomaly score
+     * @param listener onResponse is called with the thresholding model result for the raw score
+     *                 onFailure is called with ResourceNotFoundException when the model is not found
+     */
+    public void getThresholdingResult(String detectorId, String modelId, double score, ActionListener<ThresholdingResult> listener) {
+        if (thresholds.containsKey(modelId)) {
+            getThresholdingResult(thresholds.get(modelId), score, listener);
+        } else {
+            checkpointDao
+                .getModelCheckpoint(
+                    modelId,
+                    ActionListener
+                        .wrap(
+                            checkpoint -> processThresholdCheckpoint(checkpoint, modelId, detectorId, score, listener),
+                            listener::onFailure
+                        )
+                );
+        }
+    }
+
+    private void getThresholdingResult(
+        ModelState<ThresholdingModel> modelState,
+        double score,
+        ActionListener<ThresholdingResult> listener
+    ) {
+        ThresholdingModel threshold = modelState.getModel();
+        double grade = threshold.grade(score);
+        double confidence = threshold.confidence();
+        threshold.update(score);
+        modelState.setLastUsedTime(clock.instant());
+        listener.onResponse(new ThresholdingResult(grade, confidence));
+    }
+
+    private void processThresholdCheckpoint(
+        Optional<String> thresholdCheckpoint,
+        String modelId,
+        String detectorId,
+        double score,
+        ActionListener<ThresholdingResult> listener
+    ) {
+
+        Optional<ModelState<ThresholdingModel>> model = thresholdCheckpoint
+            .map(
+                checkpoint -> AccessController
+                    .doPrivileged((PrivilegedAction<ThresholdingModel>) () -> gson.fromJson(checkpoint, thresholdingModelClass))
+            )
+            .map(threshold -> new ModelState<>(threshold, modelId, detectorId, ModelType.THRESHOLD.getName(), clock.instant()));
+        if (model.isPresent()) {
+            thresholds.put(modelId, model.get());
+            getThresholdingResult(model.get(), score, listener);
+        } else {
+            throw new ResourceNotFoundException(detectorId, CommonErrorMessages.NO_CHECKPOINT_ERR_MSG + modelId);
+        }
     }
 
     /**
@@ -579,10 +691,10 @@ public class ModelManager {
             throw new IllegalArgumentException("Insufficient data for preview results. Minimum required: " + minPreviewSize);
         }
         // Train RCF models and collect non-zero scores
-        Random random = new Random();
         int rcfNumFeatures = dataPoints[0].length;
         RandomCutForest forest = RandomCutForest
             .builder()
+            .randomSeed(0L)
             .dimensions(rcfNumFeatures)
             .sampleSize(rcfNumSamplesInTree)
             .numberOfTrees(rcfNumTrees)

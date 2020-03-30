@@ -19,8 +19,13 @@ import org.elasticsearch.action.support.master.AcknowledgedResponse;
 import org.elasticsearch.client.Client;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.test.ESIntegTestCase;
+import org.elasticsearch.threadpool.ThreadPool;
 import org.junit.Before;
 import org.junit.Test;
+
+import java.time.Clock;
+
+import static org.mockito.Mockito.mock;
 
 public class IndexUtilsTests extends ESIntegTestCase {
 
@@ -29,7 +34,10 @@ public class IndexUtilsTests extends ESIntegTestCase {
     @Before
     public void setup() {
         Client client = client();
-        clientUtil = new ClientUtil(Settings.EMPTY, client);
+        Clock clock = mock(Clock.class);
+        Throttler throttler = new Throttler(clock);
+        ThreadPool threadPool = mock(ThreadPool.class);
+        clientUtil = new ClientUtil(Settings.EMPTY, client, throttler, threadPool);
     }
 
     @Test
